@@ -1,0 +1,106 @@
+name: Remote Dispatch Action Responder
+ 
+on: [repository_dispatch]
+
+jobs:
+  identify:
+    name: Set environment variables
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Patching to github environment
+        run: |
+          echo -e "${{ github.event.client_payload.configs }}" >> $GITHUB_ENV
+      -
+        name: Set the output variables
+        id: identify
+        run: |
+          echo "::set-output name=client_github_repository::$CLIENT_GITHUB_REPOSITORY"
+          echo "::set-output name=client_github_ref::$CLIENT_GITHUB_REF"
+          echo "::set-output name=client_ping_pat::$CLIENT_PING_PAT"
+          echo "::set-output name=repository_name::$REPOSITORY_NAME"
+          echo "::set-output name=branch_name::$BRANCH_NAME"
+          echo "::set-output name=ci_room_notify::$CI_ROOM_NOTIFY"
+    outputs:
+      client_github_repository: ${{ steps.identify.outputs.client_github_repository }}
+      client_github_ref: ${{ steps.identify.outputs.client_github_ref }}
+      client_ping_pat: ${{ steps.identify.outputs.client_ping_pat }}
+      repository_name: ${{ steps.identify.outputs.repository_name }}
+      branch_name: ${{ steps.identify.outputs.branch_name }}
+      ci_room_notify: ${{ steps.identify.outputs.ci_room_notify }}
+
+  test:
+    name: Testing and linting
+    needs: identify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          repository: ${{ needs.identify.outputs.client_github_repository }}
+          ref: ${{ needs.identify.outputs.client_github_ref }}
+          token: ${{ secrets[needs.identify.outputs.client_ping_pat] }}
+
+      - name: Caching Dependencies
+        uses: actions/cache@v2
+        with:
+          path: '**/node_modules'
+          key: ${{ runner.os }}-modules-${{ needs.identify.outputs.client_github_repository }}-${{ needs.identify.outputs.client_github_ref }}-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-modules-${{ needs.identify.outputs.client_github_repository }}-${{ needs.identify.outputs.client_github_ref }}-
+            ${{ runner.os }}-modules-${{ needs.identify.outputs.client_github_repository }}-
+            ${{ runner.os }}-modules-
+            ${{ runner.os }}-
+
+      - name: Install your dependencies
+        run: yarn install
+
+      - name: Run ESLint
+        run: yarn lint
+
+  build:
+    name: Build Docker Image
+    needs: [identify, test]
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v2
+        with:
+          repository: ${{ needs.identify.outputs.client_github_repository }}
+          ref: ${{ needs.identify.outputs.client_github_ref }}
+          token: ${{ secrets[needs.identify.outputs.client_ping_pat] }}
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      -
+        name: Cache Docker layers
+        uses: actions/cache@v2
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ needs.identify.outputs.client_github_repository }}-${{ needs.identify.outputs.client_github_ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-${{ needs.identify.outputs.client_github_repository }}-${{ needs.identify.outputs.client_github_ref }}-
+            ${{ runner.os }}-buildx-${{ needs.identify.outputs.client_github_repository }}-
+            ${{ runner.os }}-buildx-
+            ${{ runner.os }}-
+      -
+        name: Login to GitHub Container Registry
+        uses: docker/login-action@v1 
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.CR_PAT }}
+      -
+        name: Build and push
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.run_id }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
