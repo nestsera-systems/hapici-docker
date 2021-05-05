@@ -18,6 +18,8 @@ jobs:
           echo "::set-output name=client_github_repository::$CLIENT_GITHUB_REPOSITORY"
           echo "::set-output name=client_github_ref::$CLIENT_GITHUB_REF"
           echo "::set-output name=client_ping_pat::$CLIENT_PING_PAT"
+          echo "::set-output name=ci_server_ip::$CI_SERVER_IP"
+          echo "::set-output name=ci_server_user::$CI_SERVER_USER"
           echo "::set-output name=repository_name::$REPOSITORY_NAME"
           echo "::set-output name=branch_name::$BRANCH_NAME"
           echo "::set-output name=ci_room_notify::$CI_ROOM_NOTIFY"
@@ -25,42 +27,44 @@ jobs:
       client_github_repository: ${{ steps.identify.outputs.client_github_repository }}
       client_github_ref: ${{ steps.identify.outputs.client_github_ref }}
       client_ping_pat: ${{ steps.identify.outputs.client_ping_pat }}
+      ci_server_ip: ${{ steps.identify.outputs.ci_server_ip }}
+      ci_server_user: ${{ steps.identify.outputs.ci_server_user }}
       repository_name: ${{ steps.identify.outputs.repository_name }}
       branch_name: ${{ steps.identify.outputs.branch_name }}
       ci_room_notify: ${{ steps.identify.outputs.ci_room_notify }}
 
-  test:
-    name: Testing and linting
-    needs: identify
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          repository: ${{ needs.identify.outputs.client_github_repository }}
-          ref: ${{ needs.identify.outputs.client_github_ref }}
-          token: ${{ secrets[needs.identify.outputs.client_ping_pat] }}
+  # test:
+  #   name: Testing and linting
+  #   needs: identify
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v2
+  #       with:
+  #         repository: ${{ needs.identify.outputs.client_github_repository }}
+  #         ref: ${{ needs.identify.outputs.client_github_ref }}
+  #         token: ${{ secrets[needs.identify.outputs.client_ping_pat] }}
 
-      - name: Caching Dependencies
-        uses: actions/cache@v2
-        with:
-          path: '**/node_modules'
-          key: ${{ runner.os }}-modules-${{ needs.identify.outputs.client_github_repository }}-${{ needs.identify.outputs.client_github_ref }}-${{ hashFiles('**/yarn.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-modules-${{ needs.identify.outputs.client_github_repository }}-${{ needs.identify.outputs.client_github_ref }}-
-            ${{ runner.os }}-modules-${{ needs.identify.outputs.client_github_repository }}-
-            ${{ runner.os }}-modules-
-            ${{ runner.os }}-
+  #     - name: Caching Dependencies
+  #       uses: actions/cache@v2
+  #       with:
+  #         path: '**/node_modules'
+  #         key: ${{ runner.os }}-modules-${{ needs.identify.outputs.client_github_repository }}-${{ needs.identify.outputs.client_github_ref }}-${{ hashFiles('**/yarn.lock') }}
+  #         restore-keys: |
+  #           ${{ runner.os }}-modules-${{ needs.identify.outputs.client_github_repository }}-${{ needs.identify.outputs.client_github_ref }}-
+  #           ${{ runner.os }}-modules-${{ needs.identify.outputs.client_github_repository }}-
+  #           ${{ runner.os }}-modules-
+  #           ${{ runner.os }}-
 
-      - name: Install your dependencies
-        run: yarn install
+  #     - name: Install your dependencies
+  #       run: yarn install
 
-      - name: Run ESLint
-        run: yarn lint
+  #     - name: Run ESLint
+  #       run: yarn lint
 
   build:
     name: Build Docker Image
-    needs: [identify, test]
+    needs: [identify]
     runs-on: ubuntu-latest
     steps:
       -
@@ -104,3 +108,47 @@ jobs:
           tags: ghcr.io/${{ github.repository }}:${{ github.run_id }}
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
+
+  deploy:
+    name: Deploy Docker Image
+    runs-on: ubuntu-latest
+    needs: [identify, build]
+    env:
+      CI_SERVER_IP: ${{ needs.identify.outputs.ci_server_ip }}
+      CI_SERVER_USER: ${{ needs.identify.outputs.ci_server_user }}
+      DOCKER_IMAGE: ghcr.io/${{ github.repository }}:${{ github.run_id }}
+      REPOSITORY_NAME: ${{ needs.identify.outputs.repository_name }}
+      BRANCH_NAME: ${{ needs.identify.outputs.branch_name }}
+    steps:
+      -
+        name: Setup SSH Keys and known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ github.event.client_payload.ssh_private_key }}" | tr -d '\r' > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/id_rsa
+          ssh-keyscan -H $CI_SERVER_IP >> ~/.ssh/known_hosts
+      -
+        name: Checkout
+        uses: actions/checkout@v2
+        with:
+          repository: ${{ needs.identify.outputs.client_github_repository }}
+          ref: ${{ needs.identify.outputs.client_github_ref }}
+          token: ${{ secrets[needs.identify.outputs.client_ping_pat] }}
+      -
+        name: Syncing to a remote system
+        run: rsync -avz compose/$BRANCH_NAME $CI_SERVER_USER@$CI_SERVER_IP:$REPOSITORY_NAME
+      -
+        name: Remote access to server and deploy docker image
+        run: |
+          ssh $CI_SERVER_USER@$CI_SERVER_IP "cd $REPOSITORY_NAME/$BRANCH_NAME;
+          ls -a;
+          docker-compose stop;
+          docker-compose rm -f app;
+          echo ${{ secrets.CR_PAT }} | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin;
+          docker pull $DOCKER_IMAGE;
+          docker tag $DOCKER_IMAGE $REPOSITORY_NAME-$BRANCH_NAME:latest;
+          docker-compose up -d;
+          docker system prune -af;
+          docker logout ghcr.io;"
